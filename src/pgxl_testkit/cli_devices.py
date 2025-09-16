@@ -103,14 +103,22 @@ def flex_batch(
     r.connect()
     tune_was_on = False
     try:
-        if mode is not None:
-            r.set_mode(mode)
+        eff_mode = mode.strip().upper() if mode else None
+        if eff_mode is not None:
+            r.set_mode(eff_mode)
         if band is not None:
             r.set_band(band)
         if drive is not None:
             r.set_drive_w(drive)
+
+        # Two-tone is valid only in SSB-ish modes; auto-downgrade if user selected CW (or other)
         if two_tone is not None:
-            r.set_two_tone(two_tone)
+            allowed_two_tone = {"USB", "LSB", "DIGU", "DIGL", "SAM"}
+            if two_tone and eff_mode and eff_mode not in allowed_two_tone:
+                typer.echo(f"Two-tone not valid in {eff_mode}; using single-tone.")
+                r.set_two_tone(False)
+            else:
+                r.set_two_tone(two_tone)
 
         if tune_on and tune_off:
             typer.echo("Ignoring --tune-off because --tune-on also set.")
@@ -124,7 +132,7 @@ def flex_batch(
             ack = r.key_carrier_off()
             typer.echo(ack or "TUNE off")
 
-        # keep the client alive so TUNE stays asserted, and auto TUNE OFF after hold
+        # Keep session alive; auto TUNE OFF after hold or on Ctrl-C
         if hold < 0:
             typer.echo("Holding connection until Ctrl-C…")
             try:
@@ -142,11 +150,10 @@ def flex_batch(
                 typer.echo(ack or "TUNE off (after hold)")
         else:
             if tune_on:
-                typer.echo("Note: TUNE will drop when the client disconnects. Use --hold to keep it on then auto-off.")
+                typer.echo("Note: TUNE drops when the client disconnects. Use --hold to keep it on.")
 
     finally:
         r.disconnect()
     typer.echo("Batch complete.")
-
 
 
