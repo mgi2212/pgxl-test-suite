@@ -12,18 +12,22 @@ class FlexRadio:
     _rxbuf: str = ""
     _connected: bool = False
 
-    # ---------- connection ----------
-    def connect(self, timeout: float = 5.0) -> None:
+    def connect(self, timeout: float = 5.0, prime_window: float = 0.6) -> None:
         self._sock = socket.create_connection((self.host, self.port), timeout=timeout)
-        self._sock.settimeout(0.5)
+        self._sock.settimeout(0.1)
         self._seq = 0
         self._rxbuf = ""
         self._connected = True
-        # optional convenience
-        try:
-            self._send_counted("radio set band_persistence_enabled=0", expect_response=False)
-        except Exception:
-            pass
+        self._prime_after_connect(prime_window)
+
+    def _prime_after_connect(self, prime_window: float) -> None:
+        if not self._sock:
+            return
+        deadline = time.time() + prime_window
+        while time.time() < deadline:
+            lines = self._read_lines()
+            if not lines:
+                time.sleep(0.02)
 
     def disconnect(self) -> None:
         if self._sock:
@@ -34,7 +38,6 @@ class FlexRadio:
         self._connected = False
         self._rxbuf = ""
 
-    # ---------- low-level counted I/O ----------
     def _next_seq(self) -> int:
         self._seq += 1
         return self._seq
@@ -58,11 +61,6 @@ class FlexRadio:
         return lines
 
     def _send_counted(self, body: str, expect_response: bool = True, timeout: float = 1.5) -> Optional[str]:
-        """
-        TX: C<n>|{body}\\n
-        Wait for: R<n>|...
-        Ignores unsolicited S-lines while waiting.
-        """
         if not (self._connected and self._sock):
             raise RuntimeError("FlexRadio is not connected.")
         seq = self._next_seq()
@@ -74,7 +72,6 @@ class FlexRadio:
         want = f"R{seq}|"
         deadline = time.time() + timeout
 
-        # buffered first
         for line in self._read_lines():
             if line.startswith(want):
                 return line
@@ -84,10 +81,8 @@ class FlexRadio:
                 if line.startswith(want):
                     return line
             time.sleep(0.01)
-
         raise TimeoutError(f"No response for sequence {seq} (body='{body}')")
 
-    # ---------- helpers ----------
     @staticmethod
     def _mhz(f: float) -> str:
         return f"{f:.6f}"
@@ -102,8 +97,7 @@ class FlexRadio:
             raise ValueError(f"Unsupported band: {band_m} m")
         return centers[band_m]
 
-    # ---------- high-level API ----------
-    def set_mode(self, mode: str) -> None:  # CW, USB, AM, FM, etc.
+    def set_mode(self, mode: str) -> None:
         m = mode.strip().upper()
         self._send_counted(f"slice s 0 mode={m}")
 
@@ -117,11 +111,13 @@ class FlexRadio:
         self._send_counted(f"transmit set rfpower={pct}", expect_response=False)
         self._send_counted(f"transmit set tunepower={pct}", expect_response=False)
 
-    def key_carrier_on(self) -> None:
-        self._send_counted("transmit tune on", expect_response=False)
+    def key_carrier_on(self, wait_ack: bool = True) -> Optional[str]:
+        """Enable TUNE carrier; returns R-line if wait_ack=True."""
+        return self._send_counted("transmit tune on", expect_response=wait_ack)
 
-    def key_carrier_off(self) -> None:
-        self._send_counted("transmit tune off", expect_response=False)
+    def key_carrier_off(self, wait_ack: bool = True) -> Optional[str]:
+        """Disable TUNE carrier; returns R-line if wait_ack=True."""
+        return self._send_counted("transmit tune off", expect_response=wait_ack)
 
     def set_two_tone(self, enabled: bool) -> None:
         val = "on" if enabled else "off"
