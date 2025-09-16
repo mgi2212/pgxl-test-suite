@@ -3,17 +3,75 @@ import json
 import time
 from typing import Optional
 import typer
+from .devices.flex import FlexRadio
 
+# LAZY import Rigol inside commands (to avoid import issues when not installed on a box)
 # Lazy import PGXL inside functions; only import Flex here
 from .devices.flex import FlexRadio
 
 app = typer.Typer(help="PGXL & FlexRadio device controls")
 
+rigol_app = typer.Typer(help="Control Rigol VNA via SCPI/TCP")
 pgxl_app = typer.Typer(help="Control the Power Genius XL amplifier")
 flex_app = typer.Typer(help="Control the FlexRadio via TCP (SmartSDR)")
 
+app.add_typer(rigol_app, name="rigol")
 app.add_typer(pgxl_app, name="pgxl")
 app.add_typer(flex_app, name="flex")
+
+# ---------- Rigol (lazy import inside each command) ----------
+@rigol_app.command("idn")
+def rigol_idn(
+    host: str = typer.Option(..., "--host", help="Rigol VNA host/IP"),
+    port: int = typer.Option(5025, "--port", help="SCPI TCP port"),
+):
+    from .devices.rigol import RigolVNA
+    v = RigolVNA(host, port)
+    v.connect()
+    try:
+        typer.echo(v.idn())
+    finally:
+        v.disconnect()
+
+@rigol_app.command("s11")
+def rigol_s11(
+    host: str = typer.Option(..., "--host"),
+    port: int = typer.Option(5025, "--port"),
+    start_mhz: float = typer.Option(1.0, "--start-mhz"),
+    stop_mhz: float = typer.Option(70.0, "--stop-mhz"),
+    points: int = typer.Option(401, "--points"),
+    json_out: bool = typer.Option(False, "--json", help="Print JSON instead of table"),
+):
+    from .devices.rigol import RigolVNA
+    v = RigolVNA(host, port); v.connect()
+    try:
+        freqs, s11_db = v.sweep_s11(start_mhz*1e6, stop_mhz*1e6, points)
+    finally:
+        v.disconnect()
+    if json_out:
+        import json
+        typer.echo(json.dumps({"freq_hz": freqs, "s11_db": s11_db}))
+    else:
+        typer.echo(f"{'Freq (MHz)':>12}  {'S11 (dB)':>10}")
+        for fHz, dB in zip(freqs, s11_db):
+            typer.echo(f"{fHz/1e6:12.6f}  {dB:10.3f}")
+
+@rigol_app.command("save-s1p")
+def rigol_save_s1p(
+    host: str = typer.Option(..., "--host"),
+    port: int = typer.Option(5025, "--port"),
+    start_mhz: float = typer.Option(1.0, "--start-mhz"),
+    stop_mhz: float = typer.Option(70.0, "--stop-mhz"),
+    points: int = typer.Option(401, "--points"),
+    out: str = typer.Option("rigol_s11.s1p", "--out", help="Output Touchstone .s1p path"),
+):
+    from .devices.rigol import RigolVNA
+    v = RigolVNA(host, port); v.connect()
+    try:
+        v.save_s1p(out, start_mhz*1e6, stop_mhz*1e6, points)
+    finally:
+        v.disconnect()
+    typer.echo(f"Saved: {out}")
 
 # ---------- PGXL (lazy import inside each command) ----------
 @pgxl_app.command("status")
