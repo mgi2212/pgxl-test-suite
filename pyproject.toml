@@ -1,0 +1,25 @@
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pgxl-testkit"
+version = "0.2.0"
+description = "Menu-driven tools for testing PGXL amplifiers"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+    "matplotlib>=3.8",
+    "reportlab>=4.1",
+]
+
+[project.scripts]
+pgxl-test = "pgxl_testkit.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

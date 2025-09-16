@@ -1,0 +1,14 @@
+
+pgxl:
+  host: "192.168.0.33"
+  port: 9007
+  model: "PGXL"
+flex:
+  host: "192.168.0.20"
+  port: 4992
+vna:
+  vendor: "siglent"  # or rigol
+  visa:
+    resource: "TCPIP0::192.168.0.50::INSTR"
+    timeout_ms: 5000
+bands_m: [160,80,60,40,30,20,17,15,12,10,6]
