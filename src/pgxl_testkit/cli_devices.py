@@ -174,6 +174,130 @@ def flex_tune_off(
     finally:
         r.disconnect()
     typer.echo("FlexRadio TUNE off")
+    
+# ---------- Top-level sweep (Flex + optional PGXL) ----------
+DEFAULT_BANDS = [
+    ("160m", 1.800, 2.000),
+    ("80m",  3.500, 4.000),
+    ("60m",  5.3515, 5.3665),  # adjust for your region if needed
+    ("40m",  7.000, 7.300),
+    ("30m", 10.100, 10.150),
+    ("20m", 14.000, 14.350),
+    ("17m", 18.068, 18.168),
+    ("15m", 21.000, 21.450),
+    ("12m", 24.890, 24.990),
+    ("10m", 28.000, 29.700),
+    ("6m",  50.000, 54.000),
+]
+_BANDMAP = {name: (lo, hi) for name, lo, hi in DEFAULT_BANDS}
+
+def _band_points(lo_mhz: float, hi_mhz: float, points: int, offset_khz: float) -> list[float]:
+    pad = max(0.0, offset_khz) / 1000.0
+    a = lo_mhz + pad
+    b = hi_mhz - pad
+    if a > b:
+        raise typer.BadParameter(f"Offset {offset_khz} kHz too large for band {lo_mhz}-{hi_mhz} MHz")
+    if points <= 1:
+        return [ (a + b) / 2.0 ]
+    step = (b - a) / (points - 1)
+    return [ a + i * step for i in range(points) ]
+
+@app.command("sweep")
+def sweep(
+    # Devices
+    flex_host: str = typer.Option(..., "--flex-host", help="FlexRadio IP"),
+    flex_port: int = typer.Option(4992, "--flex-port"),
+    amp_host: Optional[str] = typer.Option(None, "--amp-host", help="PGXL IP (optional)"),
+    amp_port: int = typer.Option(9008, "--amp-port"),
+    amp_operate: bool = typer.Option(True, "--amp-operate/--no-amp-operate", help="Set PGXL to OPERATE during sweep"),
+    # Bands / points
+    band: Optional[list[str]] = typer.Option(
+        None, "--band", "-b",
+        help="Band names (repeatable). Defaults to all: 160m,80m,60m,40m,30m,20m,17m,15m,12m,10m,6m"
+    ),
+    points: int = typer.Option(3, "--points", min=1, help="Points per band (evenly spaced between edges)"),
+    offset_khz: float = typer.Option(5.0, "--offset-khz", help="Pad from each band edge"),
+    # Operating
+    mode: Optional[str] = typer.Option(None, "--mode", help="CW, USB, LSB, AM, FM, DIGU, DIGL, ..."),
+    rfpower: Optional[int] = typer.Option(10, "--rfpower", help="RF power percent 0-100 (None = leave)"),
+    tunepower: Optional[int] = typer.Option(10, "--tunepower", help="TUNE power percent 0-100 (None = leave)"),
+    two_tone: Optional[bool] = typer.Option(None, "--two-tone/--no-two-tone", help="Two-tone (SSB IMD) vs single-tone"),
+    tx: float = typer.Option(10.0, "--tx", help="TX duration per point (s)"),
+    settle: float = typer.Option(0.5, "--settle", help="Pause after tuning before TUNE on (s)"),
+    idle: float = typer.Option(5.0, "--idle", help="Idle between points (s)"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Don’t transmit; just print the plan"),
+):
+    # Resolve selected bands
+    bands = band or [name for name, _, _ in DEFAULT_BANDS]
+    missing = [b for b in bands if b not in _BANDMAP]
+    if missing:
+        raise typer.BadParameter(f"Unknown band(s): {', '.join(missing)}")
+    plan: dict[str, list[float]] = {
+        b: _band_points(*_BANDMAP[b], points=points, offset_khz=offset_khz) for b in bands
+    }
+
+    # Print plan
+    typer.echo("Sweep plan:")
+    for b in bands:
+        freqs = "  ".join(f"{f:.6f}" for f in plan[b])
+        typer.echo(f"  {b}: {freqs}")
+
+    if dry_run:
+        typer.echo("Dry-run complete.")
+        return
+
+    # Connect devices
+    r = FlexRadio(flex_host, flex_port)
+    r.connect()
+    amp = None
+    if amp_host:
+        from .devices.pgxl import PGXL  # lazy import
+        amp = PGXL(amp_host, amp_port)
+        amp.connect()
+        if amp_operate:
+            amp.operate()
+
+    # Apply radio settings up front
+    try:
+        eff_mode = mode.strip().upper() if mode else None
+        if eff_mode:
+            r.set_mode(eff_mode)
+        if rfpower is not None:
+            r.set_rf_power_pct(int(rfpower))
+        if tunepower is not None:
+            r.set_tune_power_pct(int(tunepower))
+        if two_tone is not None:
+            allowed_two_tone = {"USB", "LSB", "DIGU", "DIGL", "SAM"}
+            if two_tone and eff_mode and eff_mode not in allowed_two_tone:
+                typer.echo(f"Two-tone not valid in {eff_mode}; using single-tone.")
+                r.set_two_tone(False)
+            else:
+                r.set_two_tone(two_tone)
+
+        # Execute sweep
+        for b in bands:
+            lo, hi = _BANDMAP[b]
+            ctr = (lo + hi) / 2.0
+            typer.echo(f"\n--- {b} ({lo:.3f}-{hi:.3f} MHz, center {ctr:.3f}) ---")
+            for idx, f in enumerate(plan[b], start=1):
+                typer.echo(f"[{b}] {idx}/{len(plan[b])}  tune {f:.6f} MHz")
+                r.set_frequency_mhz(f)
+                time.sleep(settle)
+                r.key_carrier_on()
+                time.sleep(tx)
+                r.key_carrier_off()
+                time.sleep(idle)
+    finally:
+        # Return amp to STANDBY if we set OPERATE
+        if amp:
+            try:
+                if amp_operate:
+                    amp.standby()
+            finally:
+                amp.disconnect()
+        r.disconnect()
+
+    typer.echo("\nSweep complete.")
 
 @flex_app.command("batch")
 def flex_batch(
@@ -252,3 +376,56 @@ def flex_batch(
 
 if __name__ == "__main__":
     app()
+
+@flex_app.command("persist")
+def flex_persist(
+    on: bool = typer.Option(False, "--on", help="Enable band persistence"),
+    off: bool = typer.Option(False, "--off", help="Disable band persistence"),
+    flex_host: str = typer.Option(..., "--flex-host"),
+    flex_port: int = typer.Option(4992, "--flex-port"),
+):
+    if on and off:
+        typer.echo("Choose either --on or --off, not both.")
+        raise typer.Exit(2)
+    if not on and not off:
+        typer.echo("Specify one: --on or --off")
+        raise typer.Exit(2)
+
+    r = FlexRadio(flex_host, flex_port)
+    r.connect()  # connect() already disables if disable_band_persistence=True
+    try:
+        r.set_band_persistence(on and not off)
+        typer.echo(f"Band persistence {'ENABLED' if on and not off else 'DISABLED'}.")
+    finally:
+        r.disconnect()
+
+
+@flex_app.command("persist")
+def flex_persist(
+    on: bool = typer.Option(False, "--on", help="Enable band persistence (persists across reboots)"),
+    off: bool = typer.Option(False, "--off", help="Disable band persistence (persists across reboots)"),
+    status: bool = typer.Option(False, "--status", help="Show last-seen band persistence state"),
+    flex_host: str = typer.Option(..., "--flex-host"),
+    flex_port: int = typer.Option(4992, "--flex-port"),
+):
+    r = FlexRadio(flex_host, flex_port)
+    r.connect()  # connect no longer changes persistence
+    try:
+        if status and not (on or off):
+            val = r.get_band_persistence_cached()
+            if val is None:
+                typer.echo("Band persistence: unknown (radio did not report yet).")
+            else:
+                typer.echo(f"Band persistence: {'ENABLED' if val else 'DISABLED'}")
+            return
+        if on and off:
+            typer.echo("Choose either --on or --off (not both)."); raise typer.Exit(2)
+        if on:
+            r.set_band_persistence(True);  typer.echo("Band persistence ENABLED.")
+        elif off:
+            r.set_band_persistence(False); typer.echo("Band persistence DISABLED.")
+        else:
+            typer.echo("Specify one: --on  |  --off  |  --status"); raise typer.Exit(2)
+    finally:
+        r.disconnect()
+

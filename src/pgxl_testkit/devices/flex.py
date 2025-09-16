@@ -11,16 +11,27 @@ class FlexRadio:
     _seq: int = 0
     _rxbuf: str = ""
     _connected: bool = False
+    _last_band_persistence: Optional[bool] = None
 
     # ---------- connection ----------
-    def connect(self, timeout: float = 5.0, prime_window: float = 0.6) -> None:
-        """Open TCP, then absorb the initial state dump."""
+    def connect(self, timeout: float = 5.0, prime_window: float = 0.6, subscribe: bool = True) -> None:
+        """Open TCP, absorb the initial S-dump, optionally subscribe for radio updates."""
         self._sock = socket.create_connection((self.host, self.port), timeout=timeout)
         self._sock.settimeout(0.1)
         self._seq = 0
         self._rxbuf = ""
         self._connected = True
         self._prime_after_connect(prime_window)
+        if subscribe:
+            try:
+                self._send_counted("sub radio all", expect_response=True, timeout=1.0)
+            except Exception:
+                pass
+            # brief read to catch a fresh radio line (may include band_persistence_enabled)
+            end = time.time() + 0.25
+            while time.time() < end:
+                self._scan_for_band_persistence(self._read_lines())
+                time.sleep(0.01)
 
     def _prime_after_connect(self, prime_window: float) -> None:
         if not self._sock:
@@ -28,7 +39,9 @@ class FlexRadio:
         deadline = time.time() + prime_window
         while time.time() < deadline:
             lines = self._read_lines()
-            if not lines:
+            if lines:
+                self._scan_for_band_persistence(lines)
+            else:
                 time.sleep(0.02)
 
     def disconnect(self) -> None:
@@ -46,7 +59,6 @@ class FlexRadio:
         return self._seq
 
     def _read_lines(self) -> List[str]:
-        """Pull whatever is available into _rxbuf and return complete lines."""
         if not self._sock:
             return []
         try:
@@ -65,10 +77,6 @@ class FlexRadio:
         return lines
 
     def _send_counted(self, body: str, expect_response: bool = True, timeout: float = 1.5) -> Optional[str]:
-        """
-        TX: C<n>|{body}\n   Wait for: R<n>|...
-        Ignores unsolicited S-lines while waiting.
-        """
         if not (self._connected and self._sock):
             raise RuntimeError("FlexRadio is not connected.")
         seq = self._next_seq()
@@ -80,17 +88,15 @@ class FlexRadio:
         want = f"R{seq}|"
         deadline = time.time() + timeout
 
-        # scan buffered first
         for line in self._read_lines():
             if line.startswith(want):
-                return line  # e.g., "R4|0"
+                return line
 
         while time.time() < deadline:
             for line in self._read_lines():
                 if line.startswith(want):
                     return line
             time.sleep(0.01)
-
         raise TimeoutError(f"No response for sequence {seq} (body='{body}')")
 
     # ---------- helpers ----------
@@ -108,47 +114,56 @@ class FlexRadio:
             raise ValueError(f"Unsupported band: {band_m} m")
         return centers[band_m]
 
+    # ---------- band persistence ----------
+    def _scan_for_band_persistence(self, lines: List[str]) -> None:
+        for line in lines:
+            if "band_persistence_enabled=" in line:
+                try:
+                    val = line.split("band_persistence_enabled=", 1)[1].split()[0]
+                    self._last_band_persistence = (val.strip() in ("1", "true", "True"))
+                except Exception:
+                    pass
+
+    def get_band_persistence_cached(self) -> Optional[bool]:
+        """Return last-seen band persistence state (None if not yet reported)."""
+        return self._last_band_persistence
+
+    def set_band_persistence(self, enabled: bool) -> None:
+        self._send_counted(f"radio set band_persistence_enabled={1 if enabled else 0}", expect_response=False)
+        self._last_band_persistence = bool(enabled)
+
     # ---------- high-level API ----------
     def set_mode(self, mode: str) -> None:
-        """Set operating mode on TX slice 0 (CW, USB, LSB, AM, FM, DIGU, DIGL, ...)."""
         m = mode.strip().upper()
         self._send_counted(f"slice s 0 mode={m}")
 
     def set_frequency_mhz(self, f_mhz: float) -> None:
-        """Set exact frequency (MHz) on slice 0 and make it TX."""
         self._send_counted("slice s 0 tx=1", expect_response=False)
         self._send_counted(f"slice t 0 {self._mhz(f_mhz)}")
 
     def set_band(self, band_m: int) -> None:
-        """Tune TX slice 0 to the center of the requested band (MHz)."""
         ctr = self._band_center_mhz(band_m)
         self.set_frequency_mhz(ctr)
 
     def set_rf_power_pct(self, pct: int) -> None:
-        """Set RF power percentage (0-100)."""
         pct = int(max(0, min(100, pct)))
         self._send_counted(f"transmit set rfpower={pct}", expect_response=False)
 
     def set_tune_power_pct(self, pct: int) -> None:
-        """Set TUNE power percentage (0-100)."""
         pct = int(max(0, min(100, pct)))
         self._send_counted(f"transmit set tunepower={pct}", expect_response=False)
 
     def set_drive_w(self, watts: float) -> None:
-        """Convenience: set BOTH rfpower & tunepower to same percent (0-100)."""
         pct = int(max(0.0, min(100.0, watts)))
         self.set_rf_power_pct(pct)
         self.set_tune_power_pct(pct)
 
     def key_carrier_on(self, wait_ack: bool = True) -> Optional[str]:
-        """Enable TUNE carrier; returns R-line if wait_ack=True."""
         return self._send_counted("transmit tune on", expect_response=wait_ack)
 
     def key_carrier_off(self, wait_ack: bool = True) -> Optional[str]:
-        """Disable TUNE carrier; returns R-line if wait_ack=True."""
         return self._send_counted("transmit tune off", expect_response=wait_ack)
 
     def set_two_tone(self, enabled: bool) -> None:
-        """Explicitly pick tune mode: two-tone for SSB IMD, single-tone otherwise."""
         mode = "two_tone" if enabled else "single_tone"
         self._send_counted(f"transmit set tune_mode={mode}", expect_response=False)
